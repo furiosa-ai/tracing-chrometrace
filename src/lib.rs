@@ -6,285 +6,351 @@
 //! use tracing_chrometrace::ChromeLayer;
 //! use tracing_subscriber::{Registry, prelude::*};
 //!
-//! tracing_subscriber::registry().with(ChromeLayer::default()).init();
+//! let (writer, guard) = ChromeLayer::with_writer(std::io::stdout);
+//! tracing_subscriber::registry().with(writer).init();
 //! ```
 
 #![feature(thread_id_value)]
-
-use serde::Serialize;
+use derivative::Derivative;
+use derive_builder::Builder;
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::io::Write;
 use std::marker::PhantomData;
-use std::str::FromStr;
-use std::{collections::HashMap, io, process, thread, time::Instant};
+use std::sync::{Arc, RwLock};
+use std::thread::JoinHandle;
+use std::time::Instant;
+use std::{collections::HashMap, io};
+use strum::AsRefStr;
 use strum_macros::EnumString;
 use tracing::Subscriber;
 use tracing::{span, Event};
 use tracing_subscriber::{fmt::MakeWriter, layer::Context, registry::LookupSpan, Layer};
 
-#[derive(Debug, EnumString)]
+pub mod minimal;
+
+#[derive(Debug, Copy, Clone, Default, EnumString, AsRefStr, Serialize, Deserialize, PartialEq)]
 pub enum EventType {
+    #[serde(rename = "B")]
     DurationBegin,
+    #[serde(rename = "E")]
     DurationEnd,
+    #[serde(rename = "X")]
     Complete,
+    #[default]
+    #[serde(rename = "i")]
     Instant,
+    #[serde(rename = "C")]
     Counter,
+    #[serde(rename = "b")]
     AsyncStart,
+    #[serde(rename = "n")]
     AsyncInstant,
+    #[serde(rename = "e")]
     AsyncEnd,
+    #[serde(rename = "s")]
     FlowStart,
+    #[serde(rename = "t")]
     FlowStep,
+    #[serde(rename = "f")]
     FlowEnd,
+    #[serde(rename = "p")]
     Sample,
+    #[serde(rename = "N")]
     ObjectCreated,
+    #[serde(rename = "O")]
     ObjectSnapshot,
+    #[serde(rename = "D")]
     ObjectDestroyed,
+    #[serde(rename = "M")]
     Metadata,
+    #[serde(rename = "V")]
     MemoryDumpGlobal,
+    #[serde(rename = "v")]
     MemoryDumpProcess,
+    #[serde(rename = "R")]
     Mark,
+    #[serde(rename = "c")]
     ClockSync,
+    #[serde(rename = "(")]
     ContextBegin,
+    #[serde(rename = ")")]
     ContextEnd,
 }
 
-impl Serialize for EventType {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let event = match *self {
-            EventType::DurationBegin => "B",
-            EventType::DurationEnd => "E",
-            EventType::Complete => "X",
-            EventType::Instant => "i",
-            EventType::Counter => "C",
-            EventType::AsyncStart => "b",
-            EventType::AsyncInstant => "n",
-            EventType::AsyncEnd => "e",
-            EventType::FlowStart => "s",
-            EventType::FlowStep => "t",
-            EventType::FlowEnd => "f",
-            EventType::Sample => "P",
-            EventType::ObjectCreated => "N",
-            EventType::ObjectSnapshot => "O",
-            EventType::ObjectDestroyed => "D",
-            EventType::Metadata => "M",
-            EventType::MemoryDumpGlobal => "V",
-            EventType::MemoryDumpProcess => "v",
-            EventType::Mark => "R",
-            EventType::ClockSync => "c",
-            EventType::ContextBegin => "(",
-            EventType::ContextEnd => ")",
-        };
+#[derive(Derivative, Serialize, Deserialize, Builder, Debug)]
+#[derivative(PartialEq)]
+#[builder(custom_constructor)]
+#[builder(derive(Debug))]
+pub struct ChromeEvent {
+    #[builder(default)]
+    #[builder(setter(into))]
+    pub name: Cow<'static, str>,
+    #[builder(default)]
+    #[builder(setter(into))]
+    pub cat: Cow<'static, str>,
+    #[builder(default)]
+    pub ph: EventType,
+    #[builder(default = "0f64")]
+    pub ts: f64,
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dur: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub tts: Option<f64>,
+    #[builder(default)]
+    #[builder(setter(into))]
+    #[serde(default, skip_serializing_if = "str::is_empty")]
+    pub id: Cow<'static, str>,
 
-        serializer.serialize_str(event)
+    #[builder(default = "1")]
+    pub pid: u64,
+
+    #[builder(default = "1")]
+    pub tid: u64,
+
+    #[builder(default, setter(each = "arg"))]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub args: HashMap<String, String>,
+}
+
+impl ChromeEvent {
+    pub fn builder(start: Instant) -> ChromeEventBuilder {
+        let ts = Instant::now().duration_since(start).as_nanos() as f64 / 1000.0;
+        ChromeEventBuilder {
+            // start: Some(start),
+            ts: Some(ts),
+            ..ChromeEventBuilder::create_empty()
+        }
     }
 }
 
-#[derive(Serialize, Debug)]
-struct EventDescription {
-    name: String,
-    cat: String,
-    ph: EventType,
-    ts: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dur: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tts: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<String>,
-    pid: u64,
-    tid: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    args: Option<HashMap<String, String>>,
+#[derive(Debug, Default, Builder)]
+pub struct ChromeLayerConfig {
+    pub batch_size: usize,
 }
 
-impl EventDescription {
-    fn new(start: Instant, event_type: EventType, mut fields: HashMap<String, String>) -> Self {
-        let name = fields
-            .remove("name")
-            .unwrap_or("DefaultEventName".to_string());
+#[derive(Debug)]
+pub struct ChromeLayer<S> {
+    _inner: PhantomData<S>,
+    tx: crossbeam::channel::Sender<Message>,
+    buffer: Arc<RwLock<Vec<SpanInfo>>>,
+    map: Arc<RwLock<HashMap<span::Id, SpanInfo>>>,
+    config: ChromeLayerConfig,
+}
 
-        let cat = fields
-            .remove("cat")
-            .unwrap_or("DefaultCategory".to_string());
+pub struct ChromeWriterGuard {
+    handle: Option<JoinHandle<()>>,
+    tx: crossbeam::channel::Sender<Message>,
+}
 
-        let ts = fields
-            .remove("ts")
-            .map_or(start.elapsed().as_nanos() as f64 / 1000., |x| {
-                x.trim_matches('"').parse().unwrap()
-            });
-
-        let dur = fields
-            .remove("dur")
-            .map_or(None, |x| Some(x.trim_matches('"').parse().unwrap()));
-
-        let id = fields.remove("id");
-
-        let pid = fields.remove("pid").map_or(process::id() as u64, |x| {
-            x.trim_matches('"').parse().unwrap()
-        });
-
-        let tid = fields
-            .remove("tid")
-            .map_or(thread::current().id().as_u64().get(), |x| {
-                x.trim_matches('"').parse().unwrap()
-            });
-
-        EventDescription {
-            name,
-            cat,
-            ph: event_type,
-            dur,
-            ts,
-            tts: None, // Not yet supported
-            id,
-            pid,
-            tid,
-            args: if fields.len() > 0 { Some(fields) } else { None },
+impl ChromeWriterGuard {
+    fn new(handle: JoinHandle<()>, tx: crossbeam::channel::Sender<Message>) -> Self {
+        Self {
+            handle: Some(handle),
+            tx,
         }
+    }
+}
+
+impl Drop for ChromeWriterGuard {
+    fn drop(&mut self) {
+        self.tx.send(Message::Drop).unwrap();
+        let handle = self.handle.take().unwrap();
+        handle.join().unwrap();
     }
 }
 
 #[derive(Debug)]
-pub struct ChromeLayer<S, W = fn() -> std::io::Stdout> {
-    pub start: Instant,
-    make_writer: W,
-    _inner: PhantomData<S>,
+enum Message {
+    Span(Vec<SpanInfo>),
+    Drop,
 }
 
-impl<S> Default for ChromeLayer<S> {
-    fn default() -> ChromeLayer<S> {
-        Self {
-            start: Instant::now(),
-            make_writer: io::stdout,
-            _inner: PhantomData,
-        }
+fn write_spans<W>(mut writer: &mut W, spans: Vec<SpanInfo>, start: Instant)
+where
+    W: io::Write,
+{
+    for span in spans {
+        let Some(start_time) = span.start else {
+            eprintln!("no start time: {span:?}");
+            continue;
+        };
+        let Some(duration) = start_time.checked_duration_since(start) else {
+            eprintln!("duration failed: {start:?} {span:?}");
+            continue;
+        };
+        let ts = duration.as_nanos() as f64 / 1000.0;
+        let name = span.name.unwrap_or("no name".to_string());
+
+        let begin_event = ChromeEvent::builder(start_time)
+            .name(name.clone())
+            .ts(ts)
+            .ph(EventType::DurationBegin)
+            .build()
+            .expect("failed to build event");
+        serde_json::to_writer(&mut writer, &begin_event).unwrap();
+
+        let ts = span.end.unwrap().duration_since(start).as_nanos() as f64 / 1000.0;
+        let end_event = ChromeEvent::builder(start_time)
+            .name(name.clone())
+            .ts(ts)
+            .ph(EventType::DurationEnd)
+            .build()
+            .expect("failed to build event");
+        serde_json::to_writer(&mut writer, &end_event).unwrap();
+        writer.write(b",\n").unwrap();
+
+        let end = serde_json::json!({
+            "name" : name,
+            "cat" : "some category",
+            "ph": "E",
+            "pid": 1,
+            "tid": 1,
+            "ts": ts,
+        });
+        serde_json::to_writer(&mut writer, &end).unwrap();
+        writer.write(b",\n").unwrap();
     }
+    writer.flush().unwrap();
 }
 
-impl<S, W> ChromeLayer<S, W> {
-    pub fn with_writer<W2>(self, make_writer: W2) -> ChromeLayer<S, W2>
+impl<S> ChromeLayer<S> {
+    pub fn with_writer<W>(make_writer: W) -> (ChromeLayer<S>, ChromeWriterGuard)
     where
-        W2: for<'writer> MakeWriter<'writer> + 'static,
+        W: Clone + for<'writer> MakeWriter<'writer> + 'static + std::marker::Send,
     {
-        // TODO: Any other way to make a valid JSON array? Note that we even don't have close parenthesis.
-        let mut writer = make_writer.make_writer();
-        // Add dummy empty entry to make valid JSON
-        io::Write::write_all(&mut writer, b"[{}\n").unwrap();
-        drop(writer);
+        let cloned_make_writer = make_writer.clone();
+        let (tx, rx) = crossbeam::channel::unbounded::<Message>();
+        let start = Instant::now();
+        let buffer = Arc::new(RwLock::new(Vec::new()));
+        let handle = {
+            let buffer = buffer.clone();
+            std::thread::spawn(move || {
+                let mut writer = cloned_make_writer.make_writer();
+                writer.write(b"[").unwrap();
 
-        ChromeLayer {
-            start: Instant::now(),
-            make_writer,
-            _inner: PhantomData,
-        }
-    }
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        Message::Span(v) => {
+                            write_spans(&mut writer, v, start);
+                        }
+                        Message::Drop => {
+                            let remain: Vec<_> = buffer.write().unwrap().drain(..).collect();
+                            write_spans(&mut writer, remain, start);
+                            writer.write(b"]").unwrap();
+                            break;
+                        }
+                    }
+                }
+            })
+        };
 
-    fn write(&self, writer: &mut dyn io::Write, description: &EventDescription) -> io::Result<()> {
-        io::Write::write_all(
-            writer,
-            (",".to_owned() + &serde_json::to_string(description).unwrap() + "\n").as_bytes(),
+        let guard = ChromeWriterGuard::new(handle, tx.clone());
+        (
+            ChromeLayer {
+                _inner: PhantomData,
+                tx,
+                buffer,
+                map: Arc::new(RwLock::new(HashMap::new())),
+                config: ChromeLayerConfig { batch_size: 10000 },
+            },
+            guard,
         )
     }
 }
 
-struct Fields {
-    inner: HashMap<String, String>,
+struct SpanInfoVisitor<'a> {
+    span_info: &'a mut SpanInfo,
 }
 
-impl<'a> tracing_subscriber::field::Visit for Fields {
+impl tracing_subscriber::field::Visit for SpanInfoVisitor<'_> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.inner
-            .insert(field.name().to_string(), format!("{:?}", value));
+        match field.name() {
+            "name" => {
+                self.span_info.name = Some(format!("{value:?}"));
+            }
+            "cat" => {
+                self.span_info.cat = Some(format!("{value:?}"));
+            }
+            _ => {}
+        }
     }
 }
 
-impl<S, W> Layer<S> for ChromeLayer<S, W>
+#[derive(Default, Debug)]
+struct SpanInfo {
+    name: Option<String>,
+    cat: Option<String>,
+    start: Option<Instant>,
+    end: Option<Instant>,
+}
+
+impl<S> Layer<S> for ChromeLayer<S>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
-    W: for<'writer> MakeWriter<'writer> + 'static,
 {
-    fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
-        let span = ctx.span(id).expect("Span not found, this is a bug");
-
-        let mut visitor = Fields {
-            inner: HashMap::new(),
-        };
-        attrs.record(&mut visitor);
-
-        span.extensions_mut().insert(visitor);
+    fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, _ctx: Context<'_, S>) {
+        let mut span_info = SpanInfo::default();
+        attrs.record(&mut SpanInfoVisitor {
+            span_info: &mut span_info,
+        });
+        self.map.write().unwrap().insert(id.clone(), span_info);
     }
 
-    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        let mut fields = Fields {
-            inner: HashMap::new(),
-        };
-        event.record(&mut fields);
+    fn on_event(&self, _event: &Event<'_>, _ctx: Context<'_, S>) {}
 
-        let event_type = fields
-            .inner
-            .remove("event")
-            .map_or(EventType::Instant, |e| {
-                EventType::from_str(&e.trim_matches('"'))
-                    .expect(format!("EventType expected, not {:?}", e).as_str())
-            });
-
-        let description = EventDescription::new(self.start, event_type, fields.inner);
-
-        let mut writer = self.make_writer.make_writer();
-
-        self.write(&mut writer, &description)
-            .expect("Failed to write event in tracing-chrometrace");
-    }
-
-    fn on_enter(&self, id: &span::Id, ctx: Context<'_, S>) {
-        let span = ctx.span(id).expect("Span not found, this is a bug");
-
-        let mut extensions = span.extensions_mut();
-
-        if extensions.get_mut::<bool>().is_some() {
-            // If recoding of the span is already started (async case), skip it
-            return;
-        } else {
-            extensions.insert(true);
+    fn on_enter(&self, id: &span::Id, _ctx: Context<'_, S>) {
+        let mut locked_map = self.map.write().unwrap();
+        let locked_span = locked_map.get_mut(id).unwrap();
+        if locked_span.start.is_none() {
+            locked_span.start = Some(Instant::now());
         }
-
-        if let Some(fields) = extensions.get_mut::<Fields>() {
-            let mut fields = fields.inner.clone();
-
-            let event_type = fields
-                .remove("event")
-                .map_or(EventType::DurationBegin, |e| {
-                    EventType::from_str(&e.trim_matches('"'))
-                        .expect(format!("EventType expected, not {:?}", e).as_str())
-                });
-
-            let description = EventDescription::new(self.start, event_type, fields);
-
-            let mut writer = self.make_writer.make_writer();
-            self.write(&mut writer, &description)
-                .expect("Failed to write event in tracing-chrometrace");
-        };
     }
 
     fn on_exit(&self, _id: &span::Id, _ctx: Context<'_, S>) {}
 
-    fn on_close(&self, id: span::Id, ctx: Context<'_, S>) {
-        let span = ctx.span(&id).expect("Span not found, this is a bug");
+    fn on_close(&self, id: span::Id, _ctx: Context<'_, S>) {
+        let mut spaninfo = self.map.write().unwrap().remove(&id).unwrap();
+        spaninfo.end = Some(Instant::now());
+        self.buffer.write().unwrap().push(spaninfo);
+        if self.buffer.read().unwrap().len() > self.config.batch_size {
+            let drained: Vec<_> = self.buffer.write().unwrap().drain(..).collect();
+            self.tx.try_send(Message::Span(drained)).unwrap();
+        }
+    }
+}
 
-        if let Some(fields) = span.extensions().get::<Fields>() {
-            let mut fields = fields.inner.clone();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-            let event_type = fields.remove("event").map_or(EventType::DurationEnd, |e| {
-                EventType::from_str(&e.trim_matches('"'))
-                    .expect(format!("EventType expected, not {:?}", e).as_str())
-            });
+    #[test]
+    fn event_stringify() {
+        use std::str::FromStr;
+        let event = EventType::from_str("DurationBegin").unwrap();
+        matches!(event, EventType::DurationBegin);
+    }
 
-            let description = EventDescription::new(self.start, event_type, fields);
+    #[test]
+    fn test_serde() {
+        let event = ChromeEvent::builder(Instant::now())
+            .arg(("a".to_string(), "a".to_string()))
+            .ts(1.0)
+            .build()
+            .unwrap();
 
-            let mut writer = self.make_writer.make_writer();
-            self.write(&mut writer, &description)
-                .expect("Failed to write event in tracing-chrometrace");
-        };
+        let serialized = serde_json::to_string(&event).unwrap();
+        let deserialized: ChromeEvent = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(event, deserialized);
+    }
+
+    #[test]
+    fn my_test() {
+        use tracing_subscriber::prelude::*;
+        let (writer, _guard) = ChromeLayer::with_writer(std::io::stdout);
+        tracing_subscriber::registry().with(writer).init();
     }
 }
